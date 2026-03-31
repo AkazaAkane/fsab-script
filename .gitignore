@@ -1,0 +1,11 @@
+__pycache__/
+.DS_Store
+.vscode
+.env
+.env.local
+
+venv/
+fasb_pdfs/
+browser_data/
+chrome_profile/
+
