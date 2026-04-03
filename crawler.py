@@ -21,7 +21,12 @@ MIN_DELAY = 1.5
 MAX_DELAY = 3.5
 
 SKIP_ITEMS = {"Search", "Logout", "Tools"}
-SKIP_PATTERNS = ["filter_none", "Show All in One Page"]
+SKIP_PATTERNS = ["filter_none"]
+
+TARGET_TABS = {
+    "General Principles", "Presentation", "Assets", "Liabilities",
+    "Equity", "Revenue", "Expenses", "Broad Transactions", "Industry",
+}
 
 
 def find_chrome():
@@ -85,25 +90,26 @@ def find_pdf_elements(page):
     return results
 
 
-def find_publication_links(page):
-    """Find unique fasb-asc-publication links on the current page.
-
-    These are <a> links pointing to other FASB pages that may contain PDFs.
-    """
-    links = page.evaluate("""() => {
-        const anchors = document.querySelectorAll('a[href*="fasb-asc-publication"]');
-        const seen = new Set();
+def find_page_links(page):
+    """Find all PDF links and sub-links whose text contains a YYYY-MM pattern."""
+    return page.evaluate("""() => {
         const results = [];
+        const seen = new Set();
+        const anchors = document.querySelectorAll('a[href]');
+        const yearMonthRe = /\\d{4}-\\d{2}/;
         for (const a of anchors) {
-            const href = a.getAttribute('href').split('#')[0];
-            if (!seen.has(href)) {
+            const href = a.getAttribute('href') || '';
+            const text = (a.innerText || '').trim();
+            if (!href || !text || seen.has(href)) continue;
+            const isPdf = href.toLowerCase().endsWith('.pdf') || href.includes('getPdf');
+            const hasYearMonth = yearMonthRe.test(text);
+            if (isPdf || hasYearMonth) {
                 seen.add(href);
-                results.push({href: href, text: (a.innerText || '').trim().substring(0, 80)});
+                results.push({href: href, text: text.substring(0, 120), isPdf: isPdf});
             }
         }
         return results;
     }""")
-    return links
 
 
 def download_pdf_by_click(page, pdf_div_index, dest_path):
@@ -152,14 +158,15 @@ def download_pdf_by_click(page, pdf_div_index, dest_path):
     return False
 
 
-def download_all_pdfs_on_page(page, breadcrumb_label, total_pdfs, indent=""):
-    """Download all div.pdf-link PDFs on the current page."""
+def download_all_pdfs_on_page(page, breadcrumb, total_pdfs, indent=""):
+    """Download all div.pdf-link PDFs on the current page into a breadcrumb subfolder."""
     pdf_els = find_pdf_elements(page)
     if pdf_els:
-        print(f"{indent}Found {len(pdf_els)} PDF(s)")
+        folder = breadcrumb_to_folder(breadcrumb, page.url)
+        print(f"{indent}Found {len(pdf_els)} PDF(s) -> {folder.relative_to(DOWNLOAD_DIR)}")
         for pdf in pdf_els:
-            fname = safe_filename(breadcrumb_label, pdf["text"], pdf["id"])
-            dest = DOWNLOAD_DIR / fname
+            fname = safe_filename(pdf["text"], pdf["id"])
+            dest = folder / fname
             if dest.exists():
                 print(f"{indent}  Already have: {fname}")
                 continue
@@ -174,11 +181,172 @@ def download_all_pdfs_on_page(page, breadcrumb_label, total_pdfs, indent=""):
     return total_pdfs
 
 
-def safe_filename(breadcrumb, pdf_text, pdf_url):
-    parts = "_".join(breadcrumb)
-    parts = re.sub(r'[<>:"/\\|?*\n\r\t]', "_", parts)[:120].strip("_ ")
-    pdf_name = re.sub(r'[<>:"/\\|?*\n\r\t]', "_", pdf_text)[:40].strip("_ ")
-    name = f"{parts}_{pdf_name}" if pdf_name else parts
+def download_pdf_from_url(page, url, dest_path):
+    """Download a PDF given a direct URL, using fetch in-browser."""
+    try:
+        full_url = url if url.startswith("http") else urljoin(BASE_URL, url)
+        js_result = page.evaluate("""async (url) => {
+            const resp = await fetch(url);
+            if (!resp.ok) return null;
+            const buf = await resp.arrayBuffer();
+            const bytes = new Uint8Array(buf);
+            let binary = '';
+            for (let i = 0; i < bytes.length; i++) {
+                binary += String.fromCharCode(bytes[i]);
+            }
+            return btoa(binary);
+        }""", full_url)
+        if js_result:
+            dest_path.write_bytes(base64.b64decode(js_result))
+            return True
+    except Exception as exc:
+        print(f"        PDF URL download error: {exc}")
+    return False
+
+
+def process_show_all_page(page, visited, breadcrumb, total_pdfs, indent=""):
+    """Process a 'showallinonepage' URL.
+
+    - Downloads ALL PDFs found on the page (div.pdf-link and <a> PDF links).
+    - Only follows non-PDF sub-links whose text contains YYYY-MM (e.g. "2025-01").
+    """
+    show_all_url = page.url
+    print(f"{indent}Processing Show All in One Page: {show_all_url}")
+
+    total_pdfs = download_all_pdfs_on_page(page, breadcrumb, total_pdfs, indent + "  ")
+
+    page_links = find_page_links(page)
+
+    if not page_links:
+        print(f"{indent}  No PDF or YYYY-MM links found on this page")
+        return total_pdfs
+
+    seen_hrefs = set()
+    unique_links = []
+    for link in page_links:
+        href = link["href"].split("#")[0]
+        if href not in seen_hrefs:
+            seen_hrefs.add(href)
+            unique_links.append(link)
+
+    pdf_links = [l for l in unique_links if l["isPdf"]]
+    sub_links = [l for l in unique_links if not l["isPdf"]]
+
+    print(f"{indent}  Found {len(pdf_links)} PDF link(s), {len(sub_links)} YYYY-MM sub-link(s)")
+
+    folder = breadcrumb_to_folder(breadcrumb, show_all_url)
+
+    for link in pdf_links:
+        href = link["href"]
+        link_key = f"link:{href}"
+        if link_key in visited:
+            continue
+        fname = safe_filename(link["text"], href.split("/")[-1])
+        dest = folder / fname
+        if dest.exists():
+            print(f"{indent}    Already have: {fname}")
+        else:
+            print(f"{indent}    Downloading PDF: {link['text'][:80]}")
+            ok = download_pdf_from_url(page, href, dest)
+            print(f"{indent}    {'OK' if ok else 'FAILED'}: {fname}")
+            if ok:
+                total_pdfs += 1
+        visited.add(link_key)
+        save_progress(visited)
+        time.sleep(1)
+
+    for link in sub_links:
+        href = link["href"]
+        link_key = f"link:{href}"
+        if link_key in visited:
+            print(f"{indent}    Already visited: {link['text'][:60]}")
+            continue
+
+        full_url = href if href.startswith("http") else urljoin(BASE_URL, href)
+        sub_breadcrumb = breadcrumb + [link["text"][:60]]
+        print(f"{indent}    Following link: {link['text'][:80]} -> {full_url}")
+
+        try:
+            page.goto(full_url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(2000)
+
+            total_pdfs = download_all_pdfs_on_page(
+                page, sub_breadcrumb, total_pdfs, indent + "      "
+            )
+
+            sub_folder = breadcrumb_to_folder(sub_breadcrumb, page.url)
+            nested_links = find_page_links(page)
+            for sub in nested_links:
+                if sub["isPdf"]:
+                    sub_href = sub["href"]
+                    sub_fname = safe_filename(sub["text"], sub_href.split("/")[-1])
+                    sub_dest = sub_folder / sub_fname
+                    if sub_dest.exists():
+                        print(f"{indent}        Already have: {sub_fname}")
+                        continue
+                    print(f"{indent}        Downloading nested PDF: {sub['text'][:60]}")
+                    ok = download_pdf_from_url(page, sub_href, sub_dest)
+                    print(f"{indent}        {'OK' if ok else 'FAILED'}: {sub_fname}")
+                    if ok:
+                        total_pdfs += 1
+
+        except Exception as exc:
+            print(f"{indent}      Error navigating to {full_url}: {exc}")
+
+        try:
+            page.goto(show_all_url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(2000)
+        except Exception:
+            pass
+
+        visited.add(link_key)
+        save_progress(visited)
+        time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
+
+    return total_pdfs
+
+
+def sanitize_folder_name(name):
+    name = re.sub(r'[<>:"/\\|?*\n\r\t]', "_", name).strip("_ .")
+    name = re.sub(r"_+", "_", name)
+    return name[:120] or "unknown"
+
+
+def extract_topic_number(url):
+    """Extract the topic number from a FASB URL like '.../405/showallinonepage'."""
+    match = re.search(r"/(\d{3,4})(?:/|$)", url)
+    return match.group(1) if match else None
+
+
+def breadcrumb_to_folder(breadcrumb, page_url=""):
+    """Build a subfolder path: tab_name/topic_number (e.g. Liabilities/405)."""
+    folder = DOWNLOAD_DIR
+    if not breadcrumb:
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
+
+    folder = folder / sanitize_folder_name(breadcrumb[0])
+
+    topic = extract_topic_number(page_url) if page_url else None
+    if topic:
+        folder = folder / topic
+    elif len(breadcrumb) > 1:
+        topic_match = re.match(r"(\d{3,4})\s", breadcrumb[1])
+        if topic_match:
+            folder = folder / topic_match.group(1)
+        else:
+            folder = folder / sanitize_folder_name(breadcrumb[1])
+
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def safe_filename(pdf_text, pdf_id):
+    name = re.sub(r'[<>:"/\\|?*\n\r\t]', "_", pdf_text)[:100].strip("_ ")
+    if not name:
+        name = re.sub(r'[<>:"/\\|?*\n\r\t]', "_", pdf_id)[:60].strip("_ ")
+    if not name:
+        name = "download"
     if not name.lower().endswith(".pdf"):
         name += ".pdf"
     return name
@@ -210,8 +378,11 @@ def get_level_items(page, level):
     for i in range(count):
         raw = items.nth(i).inner_text()
         text = clean_text(raw)
-        if text and text not in SKIP_ITEMS and not any(p in text for p in SKIP_PATTERNS):
-            result.append({"index": i, "text": text})
+        if not text or text in SKIP_ITEMS or any(p in text for p in SKIP_PATTERNS):
+            continue
+        if level == 0 and text not in TARGET_TABS:
+            continue
+        result.append({"index": i, "text": text})
     return result
 
 
@@ -275,8 +446,49 @@ def find_and_click_by_text(page, level, target_text):
     return False
 
 
+def has_show_all_in_one_page(page, level):
+    """Check if the current menu level contains a 'Show All in One Page' item."""
+    if level == 0:
+        container = page.locator("div.left-menu-container").first
+        item_sel = "div.navElement"
+    else:
+        container = page.locator(f"div.nav-level-overflow.nav-level-{level}").first
+        item_sel = "div.subNavElement"
+
+    if container.count() == 0:
+        return False
+
+    items = container.locator(item_sel)
+    for i in range(items.count()):
+        text = clean_text(items.nth(i).inner_text())
+        if "Show All in One Page" in text:
+            return True
+    return False
+
+
+def click_show_all_in_one_page(page, level):
+    """Click the 'Show All in One Page' item at the given menu level."""
+    if level == 0:
+        container = page.locator("div.left-menu-container").first
+        item_sel = "div.navElement"
+    else:
+        container = page.locator(f"div.nav-level-overflow.nav-level-{level}").first
+        item_sel = "div.subNavElement"
+
+    if container.count() == 0:
+        return False
+
+    items = container.locator(item_sel)
+    for i in range(items.count()):
+        text = clean_text(items.nth(i).inner_text())
+        if "Show All in One Page" in text:
+            items.nth(i).click(timeout=10000)
+            return True
+    return False
+
+
 def explore(page, context, visited, breadcrumb, depth, total_pdfs):
-    """Recursively explore the menu tree."""
+    """Recursively explore the menu tree until we find 'Show All in One Page'."""
     level = depth_to_overlay_level(depth)
     indent = "  " * depth
 
@@ -306,35 +518,20 @@ def explore(page, context, visited, breadcrumb, depth, total_pdfs):
             page.wait_for_timeout(2500)
 
             current_url = page.url
-            if current_url != HOME_URL and "/Home" not in current_url:
-                print(f"{indent}      -> Page: {current_url}")
-
-                total_pdfs = download_all_pdfs_on_page(
-                    page, breadcrumb + [text], total_pdfs, indent + "      "
+            if "showallinonepage" in current_url.lower():
+                print(f"{indent}      -> Show All in One Page: {current_url}")
+                total_pdfs = process_show_all_page(
+                    page, visited, breadcrumb + [text], total_pdfs, indent + "      "
                 )
+                visited.add(path_key)
+                save_progress(visited)
 
-                pub_links = find_publication_links(page)
-                if pub_links:
-                    print(f"{indent}      Also found {len(pub_links)} publication link(s)")
-                    for pl in pub_links:
-                        pl_key = pl["href"]
-                        if pl_key in visited:
-                            continue
-                        full_url = urljoin(BASE_URL, pl["href"])
-                        print(f"{indent}        -> Following: {pl['text']}")
-                        try:
-                            page.goto(full_url, wait_until="domcontentloaded", timeout=30000)
-                            page.wait_for_timeout(2000)
-                            total_pdfs = download_all_pdfs_on_page(
-                                page, breadcrumb + [text, pl["text"]],
-                                total_pdfs, indent + "          "
-                            )
-                            visited.add(pl_key)
-                            save_progress(visited)
-                        except Exception as exc:
-                            print(f"{indent}          Error: {exc}")
-                        time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
+                go_home(page)
+                if breadcrumb:
+                    click_nav_path(page, breadcrumb)
 
+            elif current_url != HOME_URL and "/Home" not in current_url:
+                print(f"{indent}      -> Page: {current_url}")
                 visited.add(path_key)
                 save_progress(visited)
 
@@ -344,17 +541,37 @@ def explore(page, context, visited, breadcrumb, depth, total_pdfs):
 
             else:
                 next_overlay = depth_to_overlay_level(depth + 1)
-                next_items = get_level_items(page, next_overlay)
-                if next_items:
-                    print(f"{indent}      -> Submenu opened (overlay level {next_overlay}, {len(next_items)} items)")
-                    total_pdfs = explore(
-                        page, context, visited,
-                        breadcrumb + [text], depth + 1, total_pdfs
-                    )
-                else:
-                    print(f"{indent}      -> No submenu (checked overlay level {next_overlay}), no navigation")
+
+                if has_show_all_in_one_page(page, next_overlay):
+                    print(f"{indent}      -> Found 'Show All in One Page' in submenu, clicking it")
+                    click_show_all_in_one_page(page, next_overlay)
+                    page.wait_for_timeout(3000)
+
+                    if "showallinonepage" in page.url.lower():
+                        total_pdfs = process_show_all_page(
+                            page, visited, breadcrumb + [text], total_pdfs, indent + "      "
+                        )
+                    else:
+                        print(f"{indent}        Unexpected URL after clicking Show All: {page.url}")
+
                     visited.add(path_key)
                     save_progress(visited)
+
+                    go_home(page)
+                    if breadcrumb:
+                        click_nav_path(page, breadcrumb)
+                else:
+                    next_items = get_level_items(page, next_overlay)
+                    if next_items:
+                        print(f"{indent}      -> Submenu opened ({len(next_items)} items), drilling deeper")
+                        total_pdfs = explore(
+                            page, context, visited,
+                            breadcrumb + [text], depth + 1, total_pdfs
+                        )
+                    else:
+                        print(f"{indent}      -> No submenu and no 'Show All in One Page', skip")
+                        visited.add(path_key)
+                        save_progress(visited)
 
         except PwTimeout:
             print(f"{indent}      Timeout on '{text}'")
