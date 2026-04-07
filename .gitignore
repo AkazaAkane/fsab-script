@@ -8,4 +8,5 @@ venv/
 fasb_pdfs/
 browser_data/
 chrome_profile/
+fasb_browser_profile/
 
