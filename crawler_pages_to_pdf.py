@@ -124,44 +124,63 @@ def clean_text(raw):
     return raw.strip().replace("\n", " ").replace("keyboard_arrow_right", "").strip()
 
 
-def save_page_as_pdf(page, dest_path, indent=""):
-    """Capture the current page as PDF via CDP Page.printToPDF."""
+def save_using_site_print(page, dest_path, indent=""):
+    """Triggers the site's built-in ngxprint button and captures the
+    styled result via CDP. The site's Angular code preps the DOM with
+    customPrint.css, then calls window.print() which we intercept."""
+    print(f"{indent}Hooking into the browser's print function...")
+
+    page.evaluate("""() => {
+        window.__printIntercepted = false;
+        window.__origPrint = window.print;
+        window.print = function() {
+            window.__printIntercepted = true;
+        };
+    }""")
+
+    print_btn = page.locator("button[ngxprint]").filter(has_text="Print").first
+
+    if print_btn.count() == 0:
+        print(f"{indent}Could not find the site's ngxprint button, trying span fallback...")
+        print_btn = page.locator("span.close-icon-image", has_text="Print").first
+
+    if print_btn.count() == 0:
+        print(f"{indent}ERROR: No Print button found at all.")
+        return False
+
+    print(f"{indent}Clicking the site's Print button...")
+    print_btn.click(force=True)
+
+    try:
+        page.wait_for_function("window.__printIntercepted === true", timeout=15000)
+        print(f"{indent}Site prepared the print view! Capturing PDF...")
+    except Exception:
+        print(f"{indent}Timed out waiting for print prep, capturing page as-is...")
+
     try:
         cdp = page.context.new_cdp_session(page)
-
-        total_h_px = page.evaluate("() => document.body.scrollHeight") or 5000
-        page_width_px = page.evaluate("() => document.body.scrollWidth") or 1200
-
-        paper_width_in = max(page_width_px / 96, 8.5)
-        paper_height_in = max(total_h_px / 96, 11)
-
-        print(f"{indent}Page dimensions: {page_width_px}x{total_h_px}px -> paper {paper_width_in:.1f}x{paper_height_in:.1f}in")
-
         result = cdp.send("Page.printToPDF", {
             "landscape": False,
             "printBackground": True,
-            "preferCSSPageSize": False,
-            "paperWidth": paper_width_in,
-            "paperHeight": paper_height_in,
-            "marginTop": 0.3,
-            "marginBottom": 0.3,
-            "marginLeft": 0.3,
-            "marginRight": 0.3,
+            "preferCSSPageSize": True,
         })
+
         pdf_data = base64.b64decode(result["data"])
         dest_path.write_bytes(pdf_data)
         cdp.detach()
 
         print(f"{indent}Saved PDF ({len(pdf_data):,} bytes): {dest_path.name}")
+
+        page.evaluate("window.print = window.__origPrint;")
         return True
+
     except Exception as exc:
-        print(f"{indent}Error saving page as PDF: {exc}")
+        print(f"{indent}Error saving PDF: {exc}")
         return False
 
 
 def process_show_all_page(page, visited, breadcrumb, total_pdfs, indent=""):
-    """Click the page's Print span to open the print preview modal,
-    expand it, capture as PDF, then close the modal."""
+    """Navigate to the showallinonepage, trigger the site's print, and save as PDF."""
     show_all_url = page.url
     print(f"{indent}Saving Show All in One Page: {show_all_url}")
 
@@ -173,77 +192,11 @@ def process_show_all_page(page, visited, breadcrumb, total_pdfs, indent=""):
         print(f"{indent}  Already have: {fname}")
         return total_pdfs
 
-    try:
-        page.wait_for_timeout(3000)
+    page.wait_for_timeout(3000)
 
-        # Intercept window.print() before clicking — the modal's inner
-        # Print button (ngx-print) will call this and we must block it.
-        page.evaluate("""() => {
-            window.__origPrint = window.print;
-            window.print = function() {
-                window.__printIntercepted = true;
-            };
-        }""")
-
-        # The Print button on showallinonepage is:
-        # <span class="close-icon-image border-bottom-help">Print</span>
-        print(f"{indent}  Clicking Print span to open preview modal...")
-        print_span = page.locator("span.close-icon-image", has_text="Print").first
-        print_span.wait_for(state="attached", timeout=10000)
-        print_span.scroll_into_view_if_needed()
-        print_span.click(force=True)
-
-        # Wait for the print preview modal to appear
-        page.wait_for_timeout(5000)
-
-        # Check if a modal / print preview appeared
-        has_modal = page.evaluate("""() => {
-            const modal = document.querySelector('.modal-overlay-print-preview')
-                       || document.querySelector('.mainprintoverlaycontainer')
-                       || document.getElementById('print-preview-content-main');
-            return !!modal;
-        }""")
-
-        if has_modal:
-            print(f"{indent}  Print preview modal found! Expanding...")
-            page.evaluate("""() => {
-                // Expand all containers that might have scroll locks
-                const selectors = [
-                    '.modal-overlay-print-preview',
-                    '.mainprintoverlaycontainer',
-                    '#print-preview-content-main',
-                    '.print-preview-content-main',
-                    '.tc-article-print-container',
-                ];
-                for (const sel of selectors) {
-                    const el = document.querySelector(sel);
-                    if (el) {
-                        el.style.position = 'absolute';
-                        el.style.height = 'auto';
-                        el.style.maxHeight = 'none';
-                        el.style.overflow = 'visible';
-                    }
-                }
-            }""")
-            page.wait_for_timeout(2000)
-        else:
-            print(f"{indent}  No modal detected, capturing page as-is...")
-
-        ok = save_page_as_pdf(page, dest, indent + "  ")
-        if ok:
-            total_pdfs += 1
-
-        # Try to close the modal
-        try:
-            close_btn = page.locator("button.btn-secondary-action-close").first
-            if close_btn.count() > 0 and close_btn.is_visible():
-                close_btn.click(force=True)
-                page.wait_for_timeout(1000)
-        except Exception:
-            pass
-
-    except Exception as e:
-        print(f"{indent}  Error during print process: {e}")
+    ok = save_using_site_print(page, dest, indent + "  ")
+    if ok:
+        total_pdfs += 1
 
     return total_pdfs
 
